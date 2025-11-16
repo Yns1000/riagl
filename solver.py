@@ -32,8 +32,10 @@ from __future__ import annotations
 #   si nécessaire en retraçant l'itinéraire suivi.
 # =============================================================================
 
+import json
+import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional, Set, Callable
+from typing import Dict, List, Tuple, Optional, Set, Any, Callable
 
 from read_instance import Instance
 from transform_output import Output, Tour, Boxe, BoxeProduct, Order as OutOrder
@@ -222,6 +224,7 @@ def solve_instance(filename: str) -> Output:
           nécessaire.
     - Générer la structure Output et écrire le fichier solution via Output.
     """
+    debug_enabled = os.environ.get("SOLVER_DEBUG", "0") not in ("", "0")
     instance = Instance(filename)
     resolver = ShortestPathResolver(instance)
     prods = products_by_id(instance)
@@ -248,6 +251,7 @@ def solve_instance(filename: str) -> Output:
     global_box_id = 1
     total_travelled_distance = 0
     total_crossed_locations = 0
+    tour_logs: List[Dict[str, Any]] = []
 
     while True:
         # Stop si tout est fait
@@ -279,6 +283,11 @@ def solve_instance(filename: str) -> Output:
                     boxes.append(BoxState(id=global_box_id, order_id=oid))
                     global_box_id += 1
 
+        if debug_enabled:
+            print(
+                f"[DEBUG] Tour {tour_id}: activation commandes={active_orders} (cartons initiaux={len(boxes)})"
+            )
+
         # Sécurité: si aucune commande n'a pu être activée, on sort (ne devrait pas arriver)
         if not active_orders:
             break
@@ -287,6 +296,7 @@ def solve_instance(filename: str) -> Output:
         current_loc = start_loc
         travelled = 0
         crossed_locations = 0
+        tour_active_orders = list(active_orders)
 
         # Helper: quick map order -> its boxes
         order_to_boxes: Dict[int, List[BoxState]] = {}
@@ -364,6 +374,10 @@ def solve_instance(filename: str) -> Output:
             travelled += dstep
             current_loc = loc
             crossed_locations += 1
+            if debug_enabled:
+                print(
+                    f"[DEBUG] Tour {tour_id}: sélection produit={nxt} distance+={dstep}"
+                )
             # Remplir pour chaque commande active qui en a besoin (non-mixte => 1 commande)
             progress = 0
             for oid in active_orders:
@@ -374,6 +388,10 @@ def solve_instance(filename: str) -> Output:
                 if placed > 0:
                     orders_state[oid].remaining[nxt] -= placed
                     progress += placed
+                    if debug_enabled:
+                        print(
+                            f"    -> Commande {oid}: {placed}/{qty_need} unités chargées"
+                        )
             if progress == 0:
                 break
 
@@ -417,6 +435,42 @@ def solve_instance(filename: str) -> Output:
             total_travelled_distance += travelled
             total_crossed_locations += crossed_locations
 
+            total_box_capacity_w = len(boxes_out) * max(1, max_w)
+            total_box_capacity_v = len(boxes_out) * max(1, max_v)
+            weight_fill_pct = (
+                int(round(sum(b.weight for b in boxes_out) * 100 / total_box_capacity_w))
+                if total_box_capacity_w
+                else 0
+            )
+            volume_fill_pct = (
+                int(round(sum(b.volume for b in boxes_out) * 100 / total_box_capacity_v))
+                if total_box_capacity_v
+                else 0
+            )
+            tour_logs.append(
+                {
+                    "tour_id": tour_id - 1,
+                    "orders": tour_active_orders,
+                    "boxes": len(boxes_out),
+                    "travelled_distance": travelled,
+                    "crossed_locations": crossed_locations,
+                    "weight_fill_pct": weight_fill_pct,
+                    "volume_fill_pct": volume_fill_pct,
+                }
+            )
+            if debug_enabled:
+                print(
+                    "[DEBUG] Tour {tid}: distance={dist} traverses={cross} cartons={boxes} "
+                    "remplissage={weight}%/{volume}%".format(
+                        tid=tour_id - 1,
+                        dist=travelled,
+                        cross=crossed_locations,
+                        boxes=len(boxes_out),
+                        weight=weight_fill_pct,
+                        volume=volume_fill_pct,
+                    )
+                )
+
         # Loop continues until all orders done; if some active orders were not fully satisfied due to capacity, they'll be picked in next tour
 
     # Calculer quelques statistiques synthétiques
@@ -432,6 +486,14 @@ def solve_instance(filename: str) -> Output:
     else:
         avg_weight = 0
         avg_volume = 0
+
+    log_path = os.environ.get("SOLVER_TOUR_LOG")
+    if log_path and tour_logs:
+        try:
+            with open(log_path, "w", encoding="utf-8") as fh:
+                json.dump(tour_logs, fh, indent=2)
+        except OSError as exc:
+            print(f"[WARN] Impossible d'écrire le journal des tournées '{log_path}': {exc}")
 
     # Section commandes pour la sortie (nombre total de cartons par commande)
     orders_out: List[OutOrder] = [OutOrder(id=oid, nbr_boxes=orders_out_map.get(oid, 0)) for oid in sorted(orders_out_map)]
