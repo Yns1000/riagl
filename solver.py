@@ -35,7 +35,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional, Set, Any
+from typing import Dict, List, Tuple, Optional, Set, Any, Callable
 
 from read_instance import Instance
 from transform_output import Output, Tour, Boxe, BoxeProduct, Order as OutOrder
@@ -76,6 +76,12 @@ class BoxState:
         self.weight += prod_w * qty
         self.volume += prod_v * qty
         self.products[prod_id] = self.products.get(prod_id, 0) + qty
+
+
+def is_box_fill_sufficient(box_state: BoxState) -> bool:
+    """Centralise le futur seuil de remplissage minimal pour conserver un carton."""
+    # TODO(threshold): appliquer un ratio ou un poids minimal configurable ici.
+    return bool(box_state.products)
 
 
 # --------- Résolveur de plus courts chemins ---------
@@ -157,6 +163,47 @@ def next_nearest_product(current_loc: int, candidate_products: Set[int], prods_b
             best_d = d
             best_pid = pid
     return best_pid
+
+
+def select_next_product(
+    current_loc: int,
+    active_orders: List[int],
+    orders_state: Dict[int, OrderState],
+    prods_by_id: Dict[int, dict],
+    resolver: ShortestPathResolver,
+    can_placeable_units: Callable[[int, int], int],
+) -> Optional[int]:
+    """Encapsule la sélection du prochain produit à aller chercher."""
+    needed: Set[int] = set()
+    for oid in active_orders:
+        if orders_state[oid].is_done():
+            continue
+        for pid, qty in orders_state[oid].remaining.items():
+            if qty > 0:
+                needed.add(pid)
+
+    if not needed:
+        return None
+
+    # TODO(filtrage): brancher ici les règles d'exclusion des produits (incompatibilités, priorités...).
+
+    placeable: Set[int] = set()
+    for pid in needed:
+        total_placeable = 0
+        for oid in active_orders:
+            qty_need = orders_state[oid].remaining.get(pid, 0)
+            if qty_need > 0:
+                total_placeable += min(qty_need, can_placeable_units(oid, pid))
+        if total_placeable > 0:
+            placeable.add(pid)
+
+    if not placeable:
+        return None
+
+    # TODO(anticipation): ajuster la liste placeable avec l'ouverture anticipée de cartons ou de tournées.
+
+    # TODO(scoring): remplacer cette sélection par un score multi-critères (distance, importance produit, etc.).
+    return next_nearest_product(current_loc, placeable, prods_by_id, resolver)
 
 
 # --------- Core heuristic (as per the user's description) ---------
@@ -310,27 +357,14 @@ def solve_instance(filename: str) -> Output:
 
         # Tant qu'il reste de la demande pour les commandes actives et qu'on peut encore placer
         while True:
-            needed: Set[int] = set()
-            for oid in active_orders:
-                if not orders_state[oid].is_done():
-                    for pid, qty in orders_state[oid].remaining.items():
-                        if qty > 0:
-                            needed.add(pid)
-            if not needed:
-                break
-            # Filtrer aux produits qui peuvent rentrer dans les cartons (existants + ouvrables jusqu'à K)
-            placeable: Set[int] = set()
-            for pid in needed:
-                total_placeable = 0
-                for oid in active_orders:
-                    qty_need = orders_state[oid].remaining.get(pid, 0)
-                    if qty_need > 0:
-                        total_placeable += min(qty_need, can_placeable_units(oid, pid))
-                if total_placeable > 0:
-                    placeable.add(pid)
-            if not placeable:
-                break
-            nxt = next_nearest_product(current_loc, placeable, prods, resolver)
+            nxt = select_next_product(
+                current_loc=current_loc,
+                active_orders=active_orders,
+                orders_state=orders_state,
+                prods_by_id=prods,
+                resolver=resolver,
+                can_placeable_units=can_placeable_units,
+            )
             if nxt is None:
                 break
             loc = prods[nxt]["id_loc"]
@@ -372,7 +406,7 @@ def solve_instance(filename: str) -> Output:
         # Matérialiser la tournée et les cartons pour la sortie
         boxes_out: List[Boxe] = []
         for b in boxes:
-            if not b.products:
+            if not is_box_fill_sufficient(b):
                 # Skip empty boxes (unfilled due to capacity constraints)
                 continue
             bps = [BoxeProduct(product_id=pid, quantity=qty) for pid, qty in b.products.items()]
