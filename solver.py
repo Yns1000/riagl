@@ -67,6 +67,7 @@ class BoxState:
     weight: int = 0
     volume: int = 0
     products: Dict[int, int] = field(default_factory=dict)  # product_id -> qty in box
+    closed: bool = False
 
     def add(self, prod_w: int, prod_v: int, prod_id: int, qty: int) -> None:
         """Ajoute qty unités d'un produit dans ce carton et met à jour le
@@ -74,6 +75,14 @@ class BoxState:
         self.weight += prod_w * qty
         self.volume += prod_v * qty
         self.products[prod_id] = self.products.get(prod_id, 0) + qty
+
+    def close_box(self, max_w: int, max_v: int, threshold: float = 0.5) -> bool:
+        """Marque le carton comme fermé et retourne True s'il est peu rempli."""
+        self.closed = True
+        weight_ratio = (self.weight / max_w) if max_w > 0 else 1.0
+        volume_ratio = (self.volume / max_v) if max_v > 0 else 1.0
+        fill_ratio = min(weight_ratio, volume_ratio)
+        return fill_ratio < threshold
 
 
 # --------- Résolveur de plus courts chemins ---------
@@ -184,6 +193,10 @@ def solve_instance(filename: str) -> Output:
     capa = instance.capa_box or [10**9, 10**9]
     max_w = capa[0] if len(capa) > 0 else 10**9
     max_v = capa[1] if len(capa) > 1 else 10**9
+    if resolver.known:
+        long_trip_threshold = max(1, int(sum(resolver.known.values()) / len(resolver.known)))
+    else:
+        long_trip_threshold = 1
 
     # 1) Liste des produits les plus proches du point de départ
     products_sorted = products_sorted_from_start(instance, resolver)
@@ -201,6 +214,9 @@ def solve_instance(filename: str) -> Output:
     global_box_id = 1
     total_travelled_distance = 0
     total_crossed_locations = 0
+    long_trip_count = 0
+    low_fill_boxes = 0
+    tour_stats: List[Dict[str, int]] = []
 
     while True:
         # Stop si tout est fait
@@ -240,6 +256,8 @@ def solve_instance(filename: str) -> Output:
         current_loc = start_loc
         travelled = 0
         crossed_locations = 0
+        tour_long_trips = 0
+        tour_low_fill_boxes = 0
 
         # Helper: quick map order -> its boxes
         order_to_boxes: Dict[int, List[BoxState]] = {}
@@ -327,6 +345,9 @@ def solve_instance(filename: str) -> Output:
             dstep = resolver.dist(current_loc, loc)
             if dstep is None:
                 break
+            if dstep > long_trip_threshold:
+                long_trip_count += 1
+                tour_long_trips += 1
             travelled += dstep
             current_loc = loc
             crossed_locations += 1
@@ -354,6 +375,10 @@ def solve_instance(filename: str) -> Output:
         # Matérialiser la tournée et les cartons pour la sortie
         boxes_out: List[Boxe] = []
         for b in boxes:
+            is_low_fill = b.close_box(max_w, max_v)
+            if is_low_fill:
+                low_fill_boxes += 1
+                tour_low_fill_boxes += 1
             if not b.products:
                 # Skip empty boxes (unfilled due to capacity constraints)
                 continue
@@ -370,6 +395,7 @@ def solve_instance(filename: str) -> Output:
 
         # Ajouter la tournée seulement si au moins un carton a été rempli
         if boxes_out:
+            current_tour_id = tour_id
             # Mettre à jour le total de cartons par commande (global) pour respecter la limite K
             per_order_new = {}
             for b in boxes_out:
@@ -378,7 +404,16 @@ def solve_instance(filename: str) -> Output:
             for oid, cnt in per_order_new.items():
                 orders_out_map[oid] = orders_out_map.get(oid, 0) + cnt
 
-            tours_out.append(Tour(id=tour_id, boxes=boxes_out))
+            tours_out.append(Tour(id=current_tour_id, boxes=boxes_out))
+            tour_stats.append(
+                {
+                    "tour_id": current_tour_id,
+                    "travelled_distance": travelled,
+                    "crossed_locations": crossed_locations,
+                    "long_trips": tour_long_trips,
+                    "low_fill_boxes": tour_low_fill_boxes,
+                }
+            )
             tour_id += 1
             total_travelled_distance += travelled
             total_crossed_locations += crossed_locations
@@ -402,6 +437,27 @@ def solve_instance(filename: str) -> Output:
     # Section commandes pour la sortie (nombre total de cartons par commande)
     orders_out: List[OutOrder] = [OutOrder(id=oid, nbr_boxes=orders_out_map.get(oid, 0)) for oid in sorted(orders_out_map)]
 
+    summary_stats = {
+        "per_tour": tour_stats,
+        "global": {
+            "long_trip_count": long_trip_count,
+            "low_fill_boxes": low_fill_boxes,
+        },
+    }
+    if tour_stats:
+        print("===== Résumé des tournées =====")
+        for entry in tour_stats:
+            print(
+                f"Tour {entry['tour_id']}: dist={entry['travelled_distance']} "
+                f"crossed={entry['crossed_locations']} long_trips={entry['long_trips']} "
+                f"low_fill_boxes={entry['low_fill_boxes']}"
+            )
+        print(
+            "Total long trips: {long} | Total low-fill boxes: {low}".format(
+                long=long_trip_count, low=low_fill_boxes
+            )
+        )
+
     # travelled_distance / crossed_locations: mis à 0 pour le moment; on peut
     # les affiner si nécessaire par la suite.
     out = Output(
@@ -413,6 +469,7 @@ def solve_instance(filename: str) -> Output:
         tours=tours_out,
         orders=orders_out,
     )
+    setattr(out, "summary_stats", summary_stats)
     return out
 
 
